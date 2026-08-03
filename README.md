@@ -13,16 +13,17 @@ This tool post-processes any CycloneDX npm SBOM to ensure:
 
 - **Scope classification**: dev-only dependencies are marked `scope: "excluded"` (not reachable at runtime per the [CycloneDX spec](https://cyclonedx.org/docs/1.6/json/#components_items_scope)), production dependencies have their scope cleared (implied `"required"`)
 - **Complete licenses**: components missing license metadata are enriched from `node_modules/*/package.json`
+- **Hashes**: components missing hashes are enriched with SHA-512 checksums from the lockfile (`yarn.lock`, `pnpm-lock.yaml`, or `package-lock.json`)
 
 Production vs dev classification is based on transitively walking `package.json` `dependencies` (not `devDependencies`) across all workspaces — a more reliable signal than lockfile-based heuristics or static analysis.
 
 ### Generators tested (August 2026)
 
-| Generator | Scope | Licenses | Issues addressed |
-|-----------|-------|----------|-----------------|
-| [cdxgen](https://github.com/CycloneDX/cdxgen) 12.x | Most components marked `optional`; some `excluded` for type-only imports. `--required-only` can strip non-prod components. Neither mode marks dev deps as `excluded`. | Can resolve licenses by querying public registries (`FETCH_LICENSE=true`); disabled by default due to performance. Does not read from `node_modules/*/package.json`. | Scope reclassified; missing licenses enriched from local `package.json` (fast, offline) |
-| [@cyclonedx/yarn-plugin-cyclonedx](https://github.com/CycloneDX/cyclonedx-node-yarn) 3.3 | No scope set. `--prod` can strip dev deps. No option to keep all and mark dev deps as `excluded`. | Resolved from `package.json` in `node_modules` (same approach as this tool). | Scope added |
-| [pnpm sbom](https://pnpm.io/cli/sbom) 11.x | No scope set. `--prod` can strip dev deps. No option to keep all and mark dev deps as `excluded`. | Resolved from `package.json` in `node_modules` (same approach as this tool). | Scope added |
+| Generator | Scope | Licenses | Hashes | Issues addressed |
+|-----------|-------|----------|--------|-----------------|
+| [cdxgen](https://github.com/CycloneDX/cdxgen) 12.x | Most components marked `optional`; some `excluded` for type-only imports. `--required-only` can strip non-prod components. Neither mode marks dev deps as `excluded`. | Can resolve licenses by querying public registries (`FETCH_LICENSE=true`); disabled by default due to performance. Does not read from `node_modules/*/package.json`. | SHA-512 from lockfile | Scope reclassified; missing licenses enriched |
+| [@cyclonedx/yarn-plugin-cyclonedx](https://github.com/CycloneDX/cyclonedx-node-yarn) 3.3 | No scope set. `--prod` can strip dev deps. No option to keep all and mark dev deps as `excluded`. | Resolved from `package.json` in `node_modules` (same approach as this tool). | Not produced | Scope added; hashes enriched from lockfile |
+| [pnpm sbom](https://pnpm.io/cli/sbom) 11.x | No scope set. `--prod` can strip dev deps. No option to keep all and mark dev deps as `excluded`. | Resolved from `package.json` in `node_modules` (same approach as this tool). | Not produced | Scope added; hashes enriched from lockfile |
 
 ## Install
 
@@ -86,9 +87,10 @@ Dependencies are resolved from per-workspace `node_modules` directories, includi
 1. Discovers all workspace packages from `package.json` or `pnpm-workspace.yaml`
 2. Collects direct production dependencies (`dependencies`, not `devDependencies`) from each workspace, skipping `workspace:` protocol references
 3. Transitively resolves all production dependencies through `node_modules`
-4. For each component in the SBOM:
-   - **Production**: clears any existing scope (implied `"required"` per CycloneDX spec) and enriches missing license data
-   - **Dev-only**: sets `scope: "excluded"` (or removes the component in `--prod-only` mode)
+4. Parses the lockfile (`yarn.lock`, `pnpm-lock.yaml`, or `package-lock.json`) for SHA-512 checksums
+5. For each component in the SBOM:
+   - **Production**: clears any existing scope (implied `"required"` per CycloneDX spec), enriches missing license data and hashes
+   - **Dev-only**: sets `scope: "excluded"` (or removes the component in `--prod-only` mode), enriches missing license data and hashes
 
 ## License
 
