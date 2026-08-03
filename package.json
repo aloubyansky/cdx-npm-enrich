@@ -1,0 +1,34 @@
+{
+  "name": "@cyberstamp/cdx-npm-enrich",
+  "version": "0.1.0",
+  "description": "Enrich CycloneDX npm SBOMs with dev/prod scope and missing licenses",
+  "type": "module",
+  "bin": {
+    "cdx-npm-enrich": "index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cyberstamp/cdx-npm-enrich"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "cyclonedx",
+    "sbom",
+    "npm",
+    "yarn",
+    "pnpm",
+    "scope",
+    "license",
+    "enrich"
+  ]
+}
