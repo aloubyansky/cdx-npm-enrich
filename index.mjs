@@ -33,7 +33,7 @@
  *   --prod-only              Strip dev components instead of marking excluded
  */
 
-import { readFileSync, writeFileSync, readdirSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, readdirSync, existsSync, realpathSync } from "fs";
 import { join, dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 
@@ -352,7 +352,16 @@ export function filterProdOnly(bom, prodKeys, licensesByKey) {
 
 const __filename = fileURLToPath(import.meta.url);
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(__filename)) {
+function isMainModule() {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(__filename);
+  } catch {
+    return resolve(process.argv[1]) === resolve(__filename);
+  }
+}
+
+if (isMainModule()) {
   const args = process.argv.slice(2);
   const prodOnlyFlag = args.includes("--prod-only");
 
