@@ -16,6 +16,13 @@ import {
   buildLicenseEntry,
   splitSpdxExpression,
   enrichLicense,
+  enrichHash,
+  parseYarnBerryChecksums,
+  parseYarnClassicChecksums,
+  parsePackageLockChecksums,
+  parsePnpmLockChecksums,
+  parseLocfileChecksums,
+  sriBase64ToHex,
   markDevExcluded,
   filterProdOnly,
 } from "../index.mjs";
@@ -532,7 +539,251 @@ describe("filterProdOnly", () => {
 
     const result = filterProdOnly(bom, prodKeys, licMap, tmp);
     assert.equal(result.components.length, 1);
-    // jest was removed, its license should not have been resolved
     assert.ok(!licMap.has("jest@29.0.0"));
+  });
+
+  it("enriches hashes on kept components", () => {
+    const bom = minimalBom([
+      { name: "react", version: "18.3.1" },
+    ]);
+    const prodKeys = new Set(["react@18.3.1"]);
+    const hashMap = new Map([["react@18.3.1", "abcd1234"]]);
+
+    const result = filterProdOnly(bom, prodKeys, new Map(), undefined, hashMap);
+    assert.equal(result.components[0].hashes[0].alg, "SHA-512");
+    assert.equal(result.components[0].hashes[0].content, "abcd1234");
+  });
+});
+
+// ── sriBase64ToHex ───────────────────────────────────────────────────
+
+describe("sriBase64ToHex", () => {
+  it("converts base64 to hex", () => {
+    // "AAAA" in base64 = 0x000000
+    assert.equal(sriBase64ToHex("AAAA"), "000000");
+  });
+
+  it("handles real integrity hash", () => {
+    const hex = sriBase64ToHex("n4cUv75CPVAxAm+jXPJ0YJk=");
+    assert.ok(hex.length > 0);
+    assert.ok(/^[0-9a-f]+$/.test(hex));
+  });
+});
+
+// ── enrichHash ───────────────────────────────────────────────────────
+
+describe("enrichHash", () => {
+  it("adds hash when missing", () => {
+    const comp = { name: "react", version: "18.3.1" };
+    const hashMap = new Map([["react@18.3.1", "abcdef0123456789"]]);
+    enrichHash(comp, hashMap);
+    assert.equal(comp.hashes.length, 1);
+    assert.equal(comp.hashes[0].alg, "SHA-512");
+    assert.equal(comp.hashes[0].content, "abcdef0123456789");
+  });
+
+  it("does not overwrite existing hashes", () => {
+    const comp = {
+      name: "react",
+      version: "18.3.1",
+      hashes: [{ alg: "SHA-256", content: "existing" }],
+    };
+    const hashMap = new Map([["react@18.3.1", "newvalue"]]);
+    enrichHash(comp, hashMap);
+    assert.equal(comp.hashes[0].content, "existing");
+  });
+
+  it("skips when not in map", () => {
+    const comp = { name: "unknown", version: "1.0.0" };
+    enrichHash(comp, new Map());
+    assert.equal(comp.hashes, undefined);
+  });
+});
+
+// ── parseYarnBerryChecksums ──────────────────────────────────────────
+
+describe("parseYarnBerryChecksums", () => {
+  it("parses checksums with slash separator", () => {
+    const f = join(tmp, "yarn.lock");
+    writeFileSync(f, [
+      "# yarn lockfile v1",
+      "",
+      "__metadata:",
+      "  version: 8",
+      "  cacheKey: 10c0",
+      "",
+      '"react@npm:^18.0.0":',
+      "  version: 18.3.1",
+      '  resolution: "react@npm:18.3.1"',
+      "  checksum: 10c0/a8468056e46be3c63e4898268efec84e0fbbbd3c0997a4fb1dce1a87c6f9958e73e34de0bf7ad6f5a0d2f35fc3daf81c22f7dbef04c07b tried to",
+      "  languageName: node",
+      "",
+    ].join("\n"));
+    // The hex above is truncated; let's use a simpler one
+    writeFileSync(f, [
+      "__metadata:",
+      "  version: 8",
+      "",
+      '"react@npm:^18.0.0":',
+      "  version: 18.3.1",
+      "  checksum: 10c0/abcdef1234567890",
+      "",
+    ].join("\n"));
+    const result = parseYarnBerryChecksums(f);
+    assert.equal(result.size, 1);
+    assert.equal(result.get("react@18.3.1"), "abcdef1234567890");
+  });
+
+  it("handles scoped packages", () => {
+    const f = join(tmp, "yarn.lock");
+    writeFileSync(f, [
+      "__metadata:",
+      "  version: 8",
+      "",
+      '"@babel/core@npm:^7.0.0":',
+      "  version: 7.28.0",
+      "  checksum: 10c0/deadbeef0123",
+      "",
+    ].join("\n"));
+    const result = parseYarnBerryChecksums(f);
+    assert.equal(result.get("@babel/core@7.28.0"), "deadbeef0123");
+  });
+});
+
+// ── parseYarnClassicChecksums ────────────────────────────────────────
+
+describe("parseYarnClassicChecksums", () => {
+  it("parses integrity hashes", () => {
+    const f = join(tmp, "yarn.lock");
+    // base64 of 3 zero bytes = "AAAA"
+    writeFileSync(f, [
+      "# yarn lockfile v1",
+      "",
+      "react@^18.0.0:",
+      '  version "18.3.1"',
+      '  integrity "sha512-AAAA"',
+      "",
+    ].join("\n"));
+    const result = parseYarnClassicChecksums(f);
+    assert.equal(result.size, 1);
+    assert.equal(result.get("react@18.3.1"), "000000");
+  });
+});
+
+// ── parsePackageLockChecksums ────────────────────────────────────────
+
+describe("parsePackageLockChecksums", () => {
+  it("parses integrity from packages", () => {
+    const f = join(tmp, "package-lock.json");
+    writeJson(f, {
+      lockfileVersion: 3,
+      packages: {
+        "node_modules/react": {
+          version: "18.3.1",
+          integrity: "sha512-AAAA",
+        },
+        "node_modules/@babel/core": {
+          version: "7.28.0",
+          integrity: "sha512-BBBB",
+        },
+        "": { version: "1.0.0" },
+      },
+    });
+    const result = parsePackageLockChecksums(f);
+    assert.equal(result.size, 2);
+    assert.equal(result.get("react@18.3.1"), "000000");
+    assert.equal(result.get("@babel/core@7.28.0"), "041041");
+  });
+});
+
+// ── parsePnpmLockChecksums ───────────────────────────────────────────
+
+describe("parsePnpmLockChecksums", () => {
+  it("parses inline integrity hashes", () => {
+    const f = join(tmp, "pnpm-lock.yaml");
+    writeFileSync(f, [
+      "lockfileVersion: '9.0'",
+      "",
+      "packages:",
+      "",
+      "  react@18.3.1:",
+      "    resolution: {integrity: sha512-AAAA}",
+      "    engines: {node: '>=0.10.0'}",
+      "",
+    ].join("\n"));
+    const result = parsePnpmLockChecksums(f);
+    assert.equal(result.size, 1);
+    assert.equal(result.get("react@18.3.1"), "000000");
+  });
+
+  it("handles scoped packages", () => {
+    const f = join(tmp, "pnpm-lock.yaml");
+    writeFileSync(f, [
+      "packages:",
+      "",
+      "  '@babel/core@7.28.0':",
+      "    resolution: {integrity: sha512-AAAA}",
+      "",
+    ].join("\n"));
+    const result = parsePnpmLockChecksums(f);
+    assert.equal(result.get("@babel/core@7.28.0"), "000000");
+  });
+});
+
+// ── parseLocfileChecksums ────────────────────────────────────────────
+
+describe("parseLocfileChecksums", () => {
+  it("auto-detects yarn berry", () => {
+    writeFileSync(join(tmp, "yarn.lock"), [
+      "__metadata:",
+      "  version: 8",
+      "",
+      '"react@npm:^18.0.0":',
+      "  version: 18.3.1",
+      "  checksum: 10c0/abc123",
+      "",
+    ].join("\n"));
+    const result = parseLocfileChecksums(tmp);
+    assert.equal(result.get("react@18.3.1"), "abc123");
+  });
+
+  it("auto-detects pnpm", () => {
+    writeFileSync(join(tmp, "pnpm-lock.yaml"), [
+      "packages:",
+      "",
+      "  react@18.3.1:",
+      "    resolution: {integrity: sha512-AAAA}",
+      "",
+    ].join("\n"));
+    const result = parseLocfileChecksums(tmp);
+    assert.equal(result.get("react@18.3.1"), "000000");
+  });
+
+  it("returns empty map when no lockfile", () => {
+    const result = parseLocfileChecksums(tmp);
+    assert.equal(result.size, 0);
+  });
+});
+
+// ── markDevExcluded with hashes ──────────────────────────────────────
+
+describe("markDevExcluded with hashes", () => {
+  it("enriches hashes on all components", () => {
+    const bom = minimalBom([
+      { name: "react", version: "18.3.1" },
+      { name: "jest", version: "29.0.0" },
+    ]);
+    const prodKeys = new Set(["react@18.3.1"]);
+    const hashMap = new Map([
+      ["react@18.3.1", "aaa"],
+      ["jest@29.0.0", "bbb"],
+    ]);
+
+    markDevExcluded(bom, prodKeys, new Map(), undefined, hashMap);
+
+    const react = bom.components.find((c) => c.name === "react");
+    const jest = bom.components.find((c) => c.name === "jest");
+    assert.equal(react.hashes[0].content, "aaa");
+    assert.equal(jest.hashes[0].content, "bbb");
   });
 });
