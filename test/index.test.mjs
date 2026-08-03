@@ -394,6 +394,22 @@ describe("enrichLicense", () => {
     enrichLicense(comp, licMap);
     assert.equal(comp.licenses[0].license.id, "Apache-2.0");
   });
+
+  it("resolves from node_modules when not in map", () => {
+    makeNodeModule(tmp, "lodash", "4.17.21", "MIT");
+    const comp = { name: "lodash", version: "4.17.21" };
+    const licMap = new Map();
+    enrichLicense(comp, licMap, tmp);
+    assert.equal(comp.licenses[0].license.id, "MIT");
+    // Also caches in the map for subsequent calls
+    assert.equal(licMap.get("lodash@4.17.21"), "MIT");
+  });
+
+  it("handles missing package in node_modules gracefully", () => {
+    const comp = { name: "nonexistent", version: "1.0.0" };
+    enrichLicense(comp, new Map(), tmp);
+    assert.equal(comp.licenses, undefined);
+  });
 });
 
 // ── markDevExcluded ──────────────────────────────────────────────────
@@ -427,6 +443,21 @@ describe("markDevExcluded", () => {
 
     markDevExcluded(bom, prodKeys, licMap);
     assert.equal(bom.components[0].licenses[0].license.id, "MIT");
+  });
+
+  it("enriches licenses on dev components from node_modules", () => {
+    makeNodeModule(tmp, "jest", "29.0.0", "MIT");
+    const bom = minimalBom([
+      { name: "react", version: "18.3.1" },
+      { name: "jest", version: "29.0.0" },
+    ]);
+    const prodKeys = new Set(["react@18.3.1"]);
+
+    markDevExcluded(bom, prodKeys, new Map(), tmp);
+
+    const jest = bom.components.find((c) => c.name === "jest");
+    assert.equal(jest.scope, "excluded");
+    assert.equal(jest.licenses[0].license.id, "MIT");
   });
 
   it("preserves full dependency graph", () => {
@@ -488,5 +519,20 @@ describe("filterProdOnly", () => {
 
     const result = filterProdOnly(bom, prodKeys, licMap);
     assert.equal(result.components[0].licenses[0].license.id, "MIT");
+  });
+
+  it("does not resolve licenses for removed dev components", () => {
+    makeNodeModule(tmp, "jest", "29.0.0", "MIT");
+    const bom = minimalBom([
+      { name: "react", version: "18.3.1" },
+      { name: "jest", version: "29.0.0" },
+    ]);
+    const prodKeys = new Set(["react@18.3.1"]);
+    const licMap = new Map();
+
+    const result = filterProdOnly(bom, prodKeys, licMap, tmp);
+    assert.equal(result.components.length, 1);
+    // jest was removed, its license should not have been resolved
+    assert.ok(!licMap.has("jest@29.0.0"));
   });
 });
