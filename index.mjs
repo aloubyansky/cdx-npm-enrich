@@ -277,13 +277,29 @@ export function componentKey(c) {
   return `${fullName}@${c.version}`;
 }
 
-/** Enrich a component's license if missing. */
-export function enrichLicense(component, licensesByKey) {
-  if (!component.licenses || component.licenses.length === 0) {
-    const license = licensesByKey.get(componentKey(component));
-    if (license) {
-      component.licenses = buildLicenses(license);
+/** Enrich a component's license if missing, using the pre-built map
+ *  or resolving from node_modules on demand. */
+export function enrichLicense(component, licensesByKey, rootDir) {
+  if (component.licenses && component.licenses.length > 0) return;
+  const key = componentKey(component);
+  let license = licensesByKey.get(key);
+  if (!license && rootDir) {
+    const name = component.group
+      ? `${component.group}/${component.name}`
+      : component.name;
+    const pkgDir = resolvePackageDir(name, rootDir, rootDir);
+    if (pkgDir) {
+      try {
+        const pkg = JSON.parse(
+          readFileSync(join(pkgDir, "package.json"), "utf8"),
+        );
+        license = pkg.license;
+        if (license) licensesByKey.set(key, license);
+      } catch { /* ignore */ }
     }
+  }
+  if (license) {
+    component.licenses = buildLicenses(license);
   }
 }
 
@@ -292,7 +308,7 @@ export function enrichLicense(component, licensesByKey) {
  * Keeps all components and the full dependency graph.
  * Returns the modified bom.
  */
-export function markDevExcluded(bom, prodKeys, licensesByKey) {
+export function markDevExcluded(bom, prodKeys, licensesByKey, rootDir) {
   let prodCount = 0;
   let excludedCount = 0;
   for (const c of bom.components || []) {
@@ -305,11 +321,12 @@ export function markDevExcluded(bom, prodKeys, licensesByKey) {
       // "dependencies" (not "devDependencies") across all workspaces.
       // Omitting scope means "required" per the CycloneDX spec.
       delete c.scope;
-      enrichLicense(c, licensesByKey);
+      enrichLicense(c, licensesByKey, rootDir);
     } else {
       // Not reachable at runtime — only needed for build, test, or dev.
       c.scope = "excluded";
       excludedCount++;
+      enrichLicense(c, licensesByKey, rootDir);
     }
   }
   return { bom, prodCount, excludedCount };
@@ -320,13 +337,13 @@ export function markDevExcluded(bom, prodKeys, licensesByKey) {
  * components and pruning the dependency graph.
  * Returns the filtered bom.
  */
-export function filterProdOnly(bom, prodKeys, licensesByKey) {
+export function filterProdOnly(bom, prodKeys, licensesByKey, rootDir) {
   const matchingRefs = new Set();
   const filteredComponents = (bom.components || []).filter((c) => {
     if (prodKeys.has(componentKey(c))) {
       matchingRefs.add(c["bom-ref"]);
       delete c.scope;
-      enrichLicense(c, licensesByKey);
+      enrichLicense(c, licensesByKey, rootDir);
       return true;
     }
     return false;
@@ -408,7 +425,7 @@ if (isMainModule()) {
   const bom = JSON.parse(readFileSync(sbomPath, "utf8"));
 
   if (prodOnlyFlag) {
-    const filtered = filterProdOnly(bom, prodKeys, licensesByKey);
+    const filtered = filterProdOnly(bom, prodKeys, licensesByKey, projectDir);
     writeFileSync(outPath, JSON.stringify(filtered, null, 2));
     const withLicense = filtered.components.filter(
       (c) => c.licenses && c.licenses.length > 0,
@@ -421,7 +438,7 @@ if (isMainModule()) {
     );
   } else {
     const { prodCount, excludedCount } = markDevExcluded(
-      bom, prodKeys, licensesByKey,
+      bom, prodKeys, licensesByKey, projectDir,
     );
     writeFileSync(outPath, JSON.stringify(bom, null, 2));
     console.log(
