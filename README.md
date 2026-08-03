@@ -2,6 +2,9 @@
 
 Enrich [CycloneDX](https://cyclonedx.org/) SBOMs for npm/yarn/pnpm projects with dev/prod dependency scope and missing license data.
 
+> **NOTE:** In an ideal world this utility shouldn't exist. Hopefully, SBOM generators for Node.js will align on a common and standard approach to manifest prod and non-prod dependencies soon.
+
+
 ## Why
 
 CycloneDX SBOM generators for Node.js produce varying levels of scope and license coverage. Some omit scope entirely, others use lockfile heuristics or AST analysis that can misclassify dependencies. License metadata is often incomplete.
@@ -12,6 +15,14 @@ This tool post-processes any CycloneDX npm SBOM to ensure:
 - **Complete licenses**: components missing license metadata are enriched from `node_modules/*/package.json`
 
 Production vs dev classification is based on transitively walking `package.json` `dependencies` (not `devDependencies`) across all workspaces — a more reliable signal than lockfile-based heuristics or static analysis.
+
+### Generators tested (August 2026)
+
+| Generator | Scope | Licenses | Issues addressed |
+|-----------|-------|----------|-----------------|
+| [cdxgen](https://github.com/CycloneDX/cdxgen) 12.x | Most components marked `optional`; some `excluded` for type-only imports. `--required-only` can strip non-prod components. Neither mode marks dev deps as `excluded`. | Can resolve licenses by querying public registries (`FETCH_LICENSE=true`); disabled by default due to performance. Does not read from `node_modules/*/package.json`. | Scope reclassified; missing licenses enriched from local `package.json` (fast, offline) |
+| [@cyclonedx/yarn-plugin-cyclonedx](https://github.com/CycloneDX/cyclonedx-node-yarn) 3.3 | No scope set. `--prod` can strip dev deps. No option to keep all and mark dev deps as `excluded`. | Resolved from `package.json` in `node_modules` (same approach as this tool). | Scope added |
+| [pnpm sbom](https://pnpm.io/cli/sbom) 11.x | No scope set. `--prod` can strip dev deps. No option to keep all and mark dev deps as `excluded`. | Resolved from `package.json` in `node_modules` (same approach as this tool). | Scope added |
 
 ## Install
 
