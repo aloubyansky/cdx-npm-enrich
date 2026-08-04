@@ -448,6 +448,20 @@ export function enrichHash(component, hashMap) {
   }
 }
 
+/** Add evidence.identity to a component confirming its PURL via manifest analysis. */
+export function enrichEvidence(component) {
+  const evidence = component.evidence || (component.evidence = {});
+  if (evidence.identity && evidence.identity.length > 0) return;
+  evidence.identity = [{
+    field: "purl",
+    confidence: 0.6,
+    methods: [{
+      technique: "manifest-analysis",
+      value: "package-json-analysis",
+    }],
+  }];
+}
+
 // ── SBOM processing ──────────────────────────────────────────────────
 
 /** Build a component key from its group, name, and version. */
@@ -502,6 +516,7 @@ export function markDevExcluded(bom, prodKeys, licensesByKey, rootDir, hashMap) 
       delete c.scope;
       enrichLicense(c, licensesByKey, rootDir);
       if (hashMap) enrichHash(c, hashMap);
+      enrichEvidence(c);
     } else {
       // Not reachable at runtime — only needed for build, test, or dev.
       c.scope = "excluded";
@@ -526,6 +541,7 @@ export function filterProdOnly(bom, prodKeys, licensesByKey, rootDir, hashMap) {
       delete c.scope;
       enrichLicense(c, licensesByKey, rootDir);
       if (hashMap) enrichHash(c, hashMap);
+      enrichEvidence(c);
       return true;
     }
     return false;
