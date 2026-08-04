@@ -17,6 +17,7 @@ import {
   splitSpdxExpression,
   enrichLicense,
   enrichHash,
+  enrichEvidence,
   parseYarnBerryChecksums,
   parseYarnClassicChecksums,
   parsePackageLockChecksums,
@@ -419,6 +420,47 @@ describe("enrichLicense", () => {
   });
 });
 
+// ── enrichEvidence ──────────────────────────────────────────────────
+
+describe("enrichEvidence", () => {
+  it("adds evidence.identity when missing", () => {
+    const comp = { name: "react", version: "18.3.1" };
+    enrichEvidence(comp);
+    assert.equal(comp.evidence.identity.length, 1);
+    assert.equal(comp.evidence.identity[0].field, "purl");
+    assert.equal(comp.evidence.identity[0].confidence, 0.6);
+    assert.equal(comp.evidence.identity[0].methods[0].technique, "manifest-analysis");
+    assert.equal(comp.evidence.identity[0].methods[0].value, "package-json-analysis");
+  });
+
+  it("does not overwrite existing evidence.identity", () => {
+    const comp = {
+      name: "react",
+      version: "18.3.1",
+      evidence: {
+        identity: [{ field: "cpe", confidence: 1.0, methods: [] }],
+      },
+    };
+    enrichEvidence(comp);
+    assert.equal(comp.evidence.identity.length, 1);
+    assert.equal(comp.evidence.identity[0].field, "cpe");
+  });
+
+  it("preserves existing evidence.occurrences", () => {
+    const comp = {
+      name: "react",
+      version: "18.3.1",
+      evidence: {
+        occurrences: [{ location: "lib/react.js" }],
+      },
+    };
+    enrichEvidence(comp);
+    assert.equal(comp.evidence.occurrences.length, 1);
+    assert.equal(comp.evidence.occurrences[0].location, "lib/react.js");
+    assert.equal(comp.evidence.identity.length, 1);
+  });
+});
+
 // ── markDevExcluded ──────────────────────────────────────────────────
 
 describe("markDevExcluded", () => {
@@ -439,6 +481,8 @@ describe("markDevExcluded", () => {
     const jest = bom.components.find((c) => c.name === "jest");
     assert.equal(react.scope, undefined);
     assert.equal(jest.scope, "excluded");
+    assert.equal(react.evidence.identity[0].field, "purl");
+    assert.equal(jest.evidence, undefined);
   });
 
   it("enriches licenses on prod components", () => {
@@ -492,6 +536,7 @@ describe("filterProdOnly", () => {
     const result = filterProdOnly(bom, prodKeys, new Map());
     assert.equal(result.components.length, 1);
     assert.equal(result.components[0].name, "react");
+    assert.equal(result.components[0].evidence.identity[0].field, "purl");
   });
 
   it("prunes dependency graph", () => {
