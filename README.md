@@ -13,18 +13,18 @@ This tool post-processes any CycloneDX npm SBOM to ensure:
 
 - **Scope classification**: dev-only dependencies are marked `scope: "excluded"` (not reachable at runtime per the [CycloneDX spec](https://cyclonedx.org/docs/1.6/json/#components_items_scope)), production dependencies have their scope cleared (implied `"required"`)
 - **Complete licenses**: components missing license metadata are enriched from `node_modules/*/package.json`
-- **Hashes**: components missing hashes are enriched with SHA-512 checksums from the lockfile (`yarn.lock`, `pnpm-lock.yaml`, or `package-lock.json`)
+- **Hashes**: if a component's `externalReferences[type=distribution]` entry has no hashes, a SHA-512 checksum from the lockfile (`yarn.lock`, `pnpm-lock.yaml`, or `package-lock.json`) is added. Hashes are placed on the distribution external reference per the CycloneDX spec (the hash is of the registry tarball, not the component content itself). Existing distribution hashes are preserved
 - **Evidence**: production components receive CycloneDX `evidence.identity` confirming their PURL was verified via `manifest-analysis` (reading `package.json` from `node_modules`). Confidence is set to 0.6 — the top of the [CycloneDX-recommended range](https://github.com/CycloneDX/guides/blob/main/SBOM/en/0x60-Evidence.md) for manifest analysis. This is more conservative than cdxgen's 1.0: a lockfile or `package.json` confirms a package was declared and installed, but does not verify that its contents match a known-good artifact (e.g., via content hash). Existing `evidence.identity` from the upstream SBOM generator is preserved
 
-Production vs dev classification is based on transitively walking `package.json` `dependencies` (not `devDependencies`) across all workspaces — a more reliable signal than lockfile-based heuristics or static analysis.
+Production vs dev classification is based on transitively walking `package.json` `dependencies`, `peerDependencies`, and `optionalDependencies` (not `devDependencies`) across all workspaces.
 
 ### Generators tested (August 2026)
 
 | Generator | Scope | Licenses | Hashes | Evidence | Issues addressed |
 |-----------|-------|----------|--------|----------|-----------------|
-| [cdxgen](https://github.com/CycloneDX/cdxgen) 12.x | Most components marked `optional`; some `excluded` for type-only imports. `--required-only` can strip non-prod components. Neither mode marks dev deps as `excluded`. | Can resolve licenses by querying public registries (`FETCH_LICENSE=true`); disabled by default due to performance. Does not read from `node_modules/*/package.json`. | SHA-512 from lockfile | `manifest-analysis` / lockfile name, confidence 1.0 | Scope reclassified; missing licenses enriched |
+| [cdxgen](https://github.com/CycloneDX/cdxgen) 12.x | Most components marked `optional`; some `excluded` for type-only imports. `--required-only` can strip non-prod components. Neither mode marks dev deps as `excluded`. | Can resolve licenses by querying public registries (`FETCH_LICENSE=true`); disabled by default due to performance. Does not read from `node_modules/*/package.json`. | SHA-512 from lockfile on `component.hashes` (spec-incorrect — tarball hash placed at top level) | `manifest-analysis` / lockfile name, confidence 1.0 | Scope reclassified; missing licenses enriched; hashes relocated from `component.hashes` to `externalReferences[type=distribution]` |
 | [@cyclonedx/yarn-plugin-cyclonedx](https://github.com/CycloneDX/cyclonedx-node-yarn) 3.3 | No scope set. `--prod` can strip dev deps. No option to keep all and mark dev deps as `excluded`. | Resolved from `package.json` in `node_modules` (same approach as this tool). | Not produced | Not produced | Scope added; hashes enriched from lockfile; evidence added |
-| [pnpm sbom](https://pnpm.io/cli/sbom) 11.x | No scope set. `--prod` can strip dev deps. No option to keep all and mark dev deps as `excluded`. | Resolved from `package.json` in `node_modules` (same approach as this tool). | Not produced | Not produced | Scope added; hashes enriched from lockfile; evidence added |
+| [pnpm sbom](https://pnpm.io/cli/sbom) 11.x | Dev deps marked `excluded` with `cdx:npm:package:development` property; prod deps have no scope set (implied `required`). `--prod` strips dev deps, `--no-optional` strips optional deps. | Resolved from `package.json` in `node_modules` (same approach as this tool). | SHA-512 on `externalReferences[type=distribution]` (spec-correct placement) | Not produced | Evidence added (minimal value-add — pnpm sbom already handles scope, licenses, and hashes correctly) |
 
 ## Install
 
@@ -87,11 +87,16 @@ Dependencies are resolved from per-workspace `node_modules` directories, includi
 
 1. Discovers all workspace packages from `package.json` or `pnpm-workspace.yaml`
 2. Collects direct production dependencies (`dependencies`, not `devDependencies`) from each workspace, skipping `workspace:` protocol references
-3. Transitively resolves all production dependencies through `node_modules`
+3. Transitively resolves all production dependencies through `node_modules`, following `dependencies`, `peerDependencies`, and `optionalDependencies`. Symlinks are resolved so that pnpm's `.pnpm` store siblings are reachable
 4. Parses the lockfile (`yarn.lock`, `pnpm-lock.yaml`, or `package-lock.json`) for SHA-512 checksums
-5. For each component in the SBOM:
-   - **Production**: clears any existing scope (implied `"required"` per CycloneDX spec), enriches missing license data and hashes, adds `evidence.identity` (`manifest-analysis` / `package-json-analysis`, confidence 0.6)
-   - **Dev-only**: sets `scope: "excluded"` (or removes the component in `--prod-only` mode), enriches missing license data and hashes
+5. Enriches all components with missing license data and hashes (on `externalReferences[type=distribution]`). Removes `component.hashes` entries that duplicate distribution tarball hashes
+6. For each component in the SBOM:
+   - **Production**: clears any existing scope (implied `"required"` per CycloneDX spec), adds `evidence.identity` (`manifest-analysis` / `package-json-analysis`, confidence 0.6)
+   - **Dev-only**: sets `scope: "excluded"` (or removes the component in `--prod-only` mode)
+
+## Limitations
+
+The tool classifies dependencies by walking `package.json` fields (`dependencies`, `peerDependencies`, `optionalDependencies`) and, for pnpm virtual packages, scanning sibling entries in the `.pnpm` store. Peer dependencies and optional dependencies that are not installed are silently skipped — the package manager already warns about missing required peers during install.
 
 ## License
 
