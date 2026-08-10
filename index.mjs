@@ -19,8 +19,10 @@
  *
  * Components that lack license metadata are enriched by reading the
  * license field from the resolved package.json in node_modules.
- * Components that lack hashes are enriched from the lockfile
- * (yarn.lock, pnpm-lock.yaml, or package-lock.json).
+ * Components that lack hashes are enriched with SHA-512 checksums
+ * from the lockfile (yarn.lock, pnpm-lock.yaml, or package-lock.json),
+ * placed on externalReferences[type=distribution] per the CycloneDX
+ * spec (the hash is of the registry tarball, not the component content).
  *
  * Supports npm/yarn workspaces (package.json "workspaces" field)
  * and pnpm workspaces (pnpm-workspace.yaml).
@@ -163,8 +165,9 @@ export function collectDirectProdDeps(pkgFiles) {
  * pnpm content-addressable store (.pnpm directory).
  */
 export function resolvePackageDir(name, fromDir, rootDir) {
-  // Standard node_modules walk (works for npm, yarn, and pnpm direct deps)
-  let dir = fromDir;
+  // Resolve symlinks so that pnpm's .pnpm store siblings are reachable
+  let dir;
+  try { dir = realpathSync(fromDir); } catch { dir = fromDir; }
   while (dir !== dirname(dir)) {
     const candidate = join(dir, "node_modules", name, "package.json");
     if (existsSync(candidate)) return join(dir, "node_modules", name);
@@ -193,19 +196,31 @@ export function resolvePackageDir(name, fromDir, rootDir) {
 
 /**
  * Transitively resolve all production dependencies starting from
- * the direct prod deps.  Returns a Map of "name@version" -> info.
+ * the direct prod deps.  Follows dependencies, peerDependencies,
+ * and optionalDependencies (which package managers like pnpm install
+ * and make accessible at runtime).
+ *
+ * For pnpm virtual packages (store entries with `_` in the directory
+ * name, e.g. `debug@4.4.3_supports-color@8.1.1`), also scans sibling
+ * entries in the store's `node_modules/` to discover implicit peer
+ * bindings not declared in `package.json`.
+ *
+ * Returns a Map of "name@version" -> info.
  */
 export function resolveAllProdDeps(directProd, rootDir) {
   const allProd = new Map();
+  const scannedStoreEntries = new Set();
   const queue = [...directProd];
 
   while (queue.length) {
-    const { name, fromDir } = queue.pop();
+    const { name, fromDir, optional } = queue.pop();
     const pkgDir = resolvePackageDir(name, fromDir, rootDir);
     if (!pkgDir) {
-      console.warn(
-        `Warning: could not resolve production dependency '${name}'`,
-      );
+      if (!optional) {
+        console.warn(
+          `Warning: could not resolve production dependency '${name}'`,
+        );
+      }
       continue;
     }
     try {
@@ -219,6 +234,13 @@ export function resolveAllProdDeps(directProd, rootDir) {
       for (const dep of Object.keys(pkg.dependencies || {})) {
         queue.push({ name: dep, fromDir: pkgDir });
       }
+      for (const dep of Object.keys(pkg.peerDependencies || {})) {
+        queue.push({ name: dep, fromDir: pkgDir, optional: true });
+      }
+      for (const dep of Object.keys(pkg.optionalDependencies || {})) {
+        queue.push({ name: dep, fromDir: pkgDir, optional: true });
+      }
+      scanPnpmVirtualSiblings(pkgDir, queue, scannedStoreEntries);
     } catch (e) {
       console.warn(
         `Warning: could not read package.json for '${name}' in ${pkgDir}: ${e.message}`,
@@ -226,6 +248,51 @@ export function resolveAllProdDeps(directProd, rootDir) {
     }
   }
   return allProd;
+}
+
+/**
+ * If pkgDir is inside a pnpm virtual package (a .pnpm store entry
+ * whose directory name contains `_`, indicating resolved peers),
+ * scan sibling entries and queue them for resolution.
+ */
+function scanPnpmVirtualSiblings(pkgDir, queue, scannedStoreEntries) {
+  let realDir;
+  try { realDir = realpathSync(pkgDir); } catch { return; }
+  // Match .pnpm/<name>@<version>_<peer>/node_modules/<pkg>
+  const parts = realDir.split("/node_modules/");
+  if (parts.length < 2) return;
+  const storeSegment = parts[parts.length - 2];
+  // Extract the store entry name from the segment (e.g. "debug@4.0.0_supports-color@8.0.0")
+  const pnpmPrefix = ".pnpm/";
+  const pnpmIdx = storeSegment.lastIndexOf(pnpmPrefix);
+  if (pnpmIdx < 0) return;
+  const entryName = storeSegment.slice(pnpmIdx + pnpmPrefix.length);
+  if (!entryName.includes("_")) return;
+  if (scannedStoreEntries.has(entryName)) return;
+  scannedStoreEntries.add(entryName);
+  // Scan siblings — for scoped packages (@scope/name), go up two levels
+  const lastPart = parts[parts.length - 1];
+  const siblingsDir = lastPart.includes("/")
+    ? join(realDir, "..", "..")
+    : join(realDir, "..");
+  const storeFromDir = join(siblingsDir, "..");
+  try {
+    for (const entry of readdirSync(siblingsDir)) {
+      if (entry.startsWith(".")) continue;
+      if (entry.startsWith("@")) {
+        const scopeDir = join(siblingsDir, entry);
+        for (const sub of readdirSync(scopeDir)) {
+          if (existsSync(join(scopeDir, sub, "package.json"))) {
+            queue.push({ name: `${entry}/${sub}`, fromDir: storeFromDir, optional: true });
+          }
+        }
+      } else {
+        if (existsSync(join(siblingsDir, entry, "package.json"))) {
+          queue.push({ name: entry, fromDir: storeFromDir, optional: true });
+        }
+      }
+    }
+  } catch { /* ignore read errors */ }
 }
 
 // ── License helpers ──────────────────────────────────────────────────
@@ -439,13 +506,43 @@ export function parseLocfileChecksums(rootDir) {
   return new Map();
 }
 
-/** Add a SHA-512 hash to a component if it doesn't already have one. */
+/** Add a SHA-512 hash to the distribution externalReference. */
 export function enrichHash(component, hashMap) {
-  if (component.hashes && component.hashes.length > 0) return;
-  const hex = hashMap.get(componentKey(component));
-  if (hex) {
-    component.hashes = [{ alg: "SHA-512", content: hex }];
+  // Find or create the distribution externalReference
+  let distRef = null;
+  for (const ref of component.externalReferences || []) {
+    if (ref.type === "distribution") {
+      distRef = ref;
+      break;
+    }
   }
+  // Already has hashes on the distribution reference
+  if (distRef && distRef.hashes && distRef.hashes.length > 0) {
+    removeDuplicateComponentHashes(component, distRef.hashes);
+    return;
+  }
+  const hex = hashMap.get(componentKey(component));
+  if (!hex) return;
+  if (!distRef) {
+    if (!component.externalReferences) component.externalReferences = [];
+    distRef = { type: "distribution" };
+    component.externalReferences.push(distRef);
+  }
+  distRef.hashes = [{ alg: "SHA-512", content: hex }];
+  removeDuplicateComponentHashes(component, distRef.hashes);
+}
+
+/**
+ * Remove entries from component.hashes that duplicate distribution
+ * tarball hashes. Generators like cdxgen place tarball hashes on
+ * component.hashes, which is spec-incorrect — the hash is of the
+ * registry tarball, not the component content.
+ */
+function removeDuplicateComponentHashes(component, distHashes) {
+  if (!component.hashes || !component.hashes.length) return;
+  const distSet = new Set(distHashes.map(h => `${h.alg}:${h.content}`));
+  component.hashes = component.hashes.filter(h => !distSet.has(`${h.alg}:${h.content}`));
+  if (!component.hashes.length) delete component.hashes;
 }
 
 /** Add evidence.identity to a component confirming its PURL via manifest analysis. */
