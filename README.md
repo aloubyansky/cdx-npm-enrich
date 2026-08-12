@@ -1,6 +1,6 @@
 # @cyberstamp/cdx-npm-enrich
 
-Enrich [CycloneDX](https://cyclonedx.org/) SBOMs for npm/yarn/pnpm projects with dev/prod dependency scope and missing license data.
+A post-processing utility that enriches [CycloneDX](https://cyclonedx.org/) SBOMs produced by Node.js SBOM generators. It is not an SBOM generator — it takes an existing SBOM as input, cross-references it against `package.json` dependency declarations and `node_modules` contents (not the lockfile), and improves scope classification, license coverage, and hash placement.
 
 > **NOTE:** In an ideal world this utility shouldn't exist. Hopefully, SBOM generators for Node.js will align on a common and standard approach to manifest prod and non-prod dependencies soon.
 
@@ -9,14 +9,14 @@ Enrich [CycloneDX](https://cyclonedx.org/) SBOMs for npm/yarn/pnpm projects with
 
 CycloneDX SBOM generators for Node.js produce varying levels of scope and license coverage. Some omit scope entirely, others use lockfile heuristics or AST analysis that can misclassify dependencies. License metadata is often incomplete.
 
-This tool post-processes any CycloneDX npm SBOM to ensure:
+This tool post-processes a generator's output to ensure:
 
 - **Scope classification**: dev-only dependencies are marked `scope: "excluded"` (not reachable at runtime per the [CycloneDX spec](https://cyclonedx.org/docs/1.6/json/#components_items_scope)), production dependencies have their scope cleared (implied `"required"`)
 - **Complete licenses**: components missing license metadata are enriched from `node_modules/*/package.json`
 - **Hashes**: if a component's `externalReferences[type=distribution]` entry has no hashes, a SHA-512 checksum from the lockfile (`yarn.lock`, `pnpm-lock.yaml`, or `package-lock.json`) is added. Hashes are placed on the distribution external reference per the CycloneDX spec (the hash is of the registry tarball, not the component content itself). Existing distribution hashes are preserved
 - **Evidence**: production components receive CycloneDX `evidence.identity` confirming their PURL was verified via `manifest-analysis` (reading `package.json` from `node_modules`). Confidence is set to 0.6 — the top of the [CycloneDX-recommended range](https://github.com/CycloneDX/guides/blob/main/SBOM/en/0x60-Evidence.md) for manifest analysis. This is more conservative than cdxgen's 1.0: a lockfile or `package.json` confirms a package was declared and installed, but does not verify that its contents match a known-good artifact (e.g., via content hash). Existing `evidence.identity` from the upstream SBOM generator is preserved
 
-Production vs dev classification is based on transitively walking `package.json` `dependencies`, `peerDependencies`, and `optionalDependencies` (not `devDependencies`) across all workspaces.
+Production vs dev classification builds the dependency graph reachable from workspace `dependencies` (following `dependencies`, `peerDependencies`, and `optionalDependencies` — never `devDependencies`), then classifies each package based on the edge types through which it was reached. Peer dependencies are gated by the consumer workspace's declaration — see [Peer dependency classification](#peer-dependency-classification) below.
 
 ### Generators tested (August 2026)
 
@@ -85,18 +85,31 @@ Dependencies are resolved from per-workspace `node_modules` directories, includi
 
 ## How it works
 
-1. Discovers all workspace packages from `package.json` or `pnpm-workspace.yaml`
-2. Collects direct production dependencies (`dependencies`, not `devDependencies`) from each workspace, skipping `workspace:` protocol references
-3. Transitively resolves all production dependencies through `node_modules`, following `dependencies`, `peerDependencies`, and `optionalDependencies`. Symlinks are resolved so that pnpm's `.pnpm` store siblings are reachable
-4. Parses the lockfile (`yarn.lock`, `pnpm-lock.yaml`, or `package-lock.json`) for SHA-512 checksums
-5. Enriches all components with missing license data and hashes (on `externalReferences[type=distribution]`). Removes `component.hashes` entries that duplicate distribution tarball hashes
-6. For each component in the SBOM:
-   - **Production**: clears any existing scope (implied `"required"` per CycloneDX spec), adds `evidence.identity` (`manifest-analysis` / `package-json-analysis`, confidence 0.6)
-   - **Dev-only**: sets `scope: "excluded"` (or removes the component in `--prod-only` mode)
+1. **Workspace discovery**: finds all workspace packages from `package.json` (`workspaces` field) or `pnpm-workspace.yaml`
+2. **Graph construction**: collects direct production dependencies (`dependencies`, not `devDependencies`) from each workspace, skipping `workspace:` protocol references. Transitively walks reachable packages through `node_modules`, following `dependencies`, `peerDependencies`, and `optionalDependencies` at each level — `devDependencies` are never followed. Symlinks are resolved so that pnpm's `.pnpm` store siblings are reachable. For pnpm virtual packages (store entries with `_` in the directory name), sibling entries are scanned to discover implicit peer bindings
+3. **Prod/dev classification**: propagates production status through the graph. Regular dependencies and optional dependencies are always production. Peer dependencies are classified based on how the consuming workspace declared them (see below)
+4. **Lockfile parsing**: reads SHA-512 checksums from `yarn.lock`, `pnpm-lock.yaml`, or `package-lock.json`
+5. **Enrichment**: adds missing license data, hashes (on `externalReferences[type=distribution]`), and `evidence.identity` to production components. Removes `component.hashes` entries that duplicate distribution tarball hashes
+6. **Output**: production components have their scope cleared (implied `"required"` per CycloneDX spec). Dev-only components get `scope: "excluded"` (or are removed in `--prod-only` mode)
+
+### Peer dependency classification
+
+A `peerDependencies` declaration is neutral — it says "the host must provide this" but doesn't indicate whether the package is needed at runtime or only during development. The **consumer's** declaration determines the classification:
+
+- If a workspace has package A in `dependencies` and A declares a peer dep on B:
+  - B in the workspace's `dependencies` → **production** (explicitly declared as runtime)
+  - B in the workspace's `devDependencies` (not in `dependencies`) → **dev-only** (consumer signaled it's not needed at runtime)
+  - B not declared by the workspace at all → **production** (safe default — the consumer didn't signal dev-only, and A needs B at runtime)
+
+- If A is a **transitive** dependency (not directly in any workspace's `dependencies`), the tool falls back to a project-level check: B is dev-only if it appears only in `devDependencies` across all workspaces and never in any workspace's `dependencies`
+
+- A package reached as dev-only through a peer dep edge can still be production if it's reachable through a regular `dependencies` edge from another production package. Classification never downgrades from prod to dev
 
 ## Limitations
 
-The tool classifies dependencies by walking `package.json` fields (`dependencies`, `peerDependencies`, `optionalDependencies`) and, for pnpm virtual packages, scanning sibling entries in the `.pnpm` store. Peer dependencies and optional dependencies that are not installed are silently skipped — the package manager already warns about missing required peers during install.
+- The tool classifies dependencies by walking `package.json` fields, not by analyzing actual code usage. A declared production dependency that is never imported at runtime will still be classified as production
+- Peer dependencies and optional dependencies that are not installed are silently skipped — the package manager already warns about missing required peers during install
+- For pnpm, implicit peer bindings are discovered by scanning sibling entries in virtual store directories. This relies on pnpm's internal directory naming convention (`_` separator for peer variants)
 
 ## License
 
