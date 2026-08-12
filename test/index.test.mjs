@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
@@ -70,6 +70,14 @@ function makePnpmModule(root, name, version, license, deps, extra) {
   if (extra) Object.assign(pkg, extra);
   writeJson(join(dir, "package.json"), pkg);
   return storeBase;
+}
+
+function loadWsPackages(pkgFiles) {
+  const m = new Map();
+  for (const pf of pkgFiles) {
+    m.set(dirname(pf), JSON.parse(readFileSync(pf, "utf8")));
+  }
+  return m;
 }
 
 function minimalBom(components) {
@@ -567,6 +575,272 @@ describe("resolveAllProdDeps", () => {
       !warnings.some(w => w.includes("missing-peer")),
       "should not warn for unresolved sibling-discovered deps",
     );
+  });
+});
+
+// ── peer dep classification ─────────────────────────────────────────
+
+describe("peer dep dev/prod classification", () => {
+  it("peer dep in consumer devDependencies is excluded", () => {
+    // Workspace: dependencies: { A }, devDependencies: { B }
+    // A: peerDependencies: { B }
+    makePkg(tmp, {
+      name: "app", version: "1.0.0",
+      dependencies: { A: "1.0.0" },
+      devDependencies: { B: "1.0.0" },
+    });
+    makeNodeModule(tmp, "A", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "B", "1.0.0", "MIT", { X: "^1.0.0" });
+    makeNodeModule(tmp, "X", "1.0.0", "MIT");
+
+    const pkgFiles = [join(tmp, "package.json")];
+    const directProd = collectDirectProdDeps(pkgFiles);
+    const wsPackages = loadWsPackages(pkgFiles);
+    const result = resolveAllProdDeps(directProd, tmp, wsPackages);
+
+    assert.ok(result.has("A@1.0.0"), "A is prod");
+    assert.ok(!result.has("B@1.0.0"), "B is dev-only peer dep");
+    assert.ok(!result.has("X@1.0.0"), "X (transitive of B) is also excluded");
+  });
+
+  it("peer dep with no consumer declaration is included", () => {
+    // Workspace: dependencies: { A }
+    // A: peerDependencies: { B }
+    // B is installed but not declared in workspace
+    makePkg(tmp, {
+      name: "app", version: "1.0.0",
+      dependencies: { A: "1.0.0" },
+    });
+    makeNodeModule(tmp, "A", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "B", "1.0.0", "MIT");
+
+    const pkgFiles = [join(tmp, "package.json")];
+    const directProd = collectDirectProdDeps(pkgFiles);
+    const wsPackages = loadWsPackages(pkgFiles);
+    const result = resolveAllProdDeps(directProd, tmp, wsPackages);
+
+    assert.ok(result.has("A@1.0.0"));
+    assert.ok(result.has("B@1.0.0"), "undeclared peer dep should be followed");
+  });
+
+  it("peer dep in consumer dependencies is included", () => {
+    // Workspace: dependencies: { A, B }
+    // A: peerDependencies: { B }
+    makePkg(tmp, {
+      name: "app", version: "1.0.0",
+      dependencies: { A: "1.0.0", B: "1.0.0" },
+    });
+    makeNodeModule(tmp, "A", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "B", "1.0.0", "MIT");
+
+    const pkgFiles = [join(tmp, "package.json")];
+    const directProd = collectDirectProdDeps(pkgFiles);
+    const wsPackages = loadWsPackages(pkgFiles);
+    const result = resolveAllProdDeps(directProd, tmp, wsPackages);
+
+    assert.ok(result.has("A@1.0.0"));
+    assert.ok(result.has("B@1.0.0"), "peer dep in dependencies is always prod");
+  });
+
+  it("same peer dep, all consumers declare devDependency", () => {
+    // Workspace-1: dependencies: { A }, devDependencies: { B }
+    // Workspace-2: dependencies: { C }, devDependencies: { B }
+    // A: peerDependencies: { B }
+    // C: peerDependencies: { B }
+    const ws1 = join(tmp, "packages", "ws1");
+    const ws2 = join(tmp, "packages", "ws2");
+    makePkg(tmp, {
+      name: "root", version: "1.0.0",
+      workspaces: ["packages/*"],
+    });
+    makePkg(ws1, {
+      name: "ws1", version: "1.0.0",
+      dependencies: { A: "1.0.0" },
+      devDependencies: { B: "1.0.0" },
+    });
+    makePkg(ws2, {
+      name: "ws2", version: "1.0.0",
+      dependencies: { C: "1.0.0" },
+      devDependencies: { B: "1.0.0" },
+    });
+    makeNodeModule(tmp, "A", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "C", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "B", "1.0.0", "MIT");
+
+    const pkgFiles = [join(ws1, "package.json"), join(ws2, "package.json")];
+    const directProd = collectDirectProdDeps(pkgFiles);
+    const wsPackages = loadWsPackages(pkgFiles);
+    const result = resolveAllProdDeps(directProd, tmp, wsPackages);
+
+    assert.ok(result.has("A@1.0.0"));
+    assert.ok(result.has("C@1.0.0"));
+    assert.ok(!result.has("B@1.0.0"), "B is dev-only in all consumers");
+  });
+
+  it("same peer dep, one consumer undeclared — included", () => {
+    // Workspace-1: dependencies: { A } (no declaration of B)
+    // Workspace-2: dependencies: { C }, devDependencies: { B }
+    // A: peerDependencies: { B }
+    // C: peerDependencies: { B }
+    const ws1 = join(tmp, "packages", "ws1");
+    const ws2 = join(tmp, "packages", "ws2");
+    makePkg(tmp, {
+      name: "root", version: "1.0.0",
+      workspaces: ["packages/*"],
+    });
+    makePkg(ws1, {
+      name: "ws1", version: "1.0.0",
+      dependencies: { A: "1.0.0" },
+    });
+    makePkg(ws2, {
+      name: "ws2", version: "1.0.0",
+      dependencies: { C: "1.0.0" },
+      devDependencies: { B: "1.0.0" },
+    });
+    makeNodeModule(tmp, "A", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "C", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "B", "1.0.0", "MIT");
+
+    const pkgFiles = [join(ws1, "package.json"), join(ws2, "package.json")];
+    const directProd = collectDirectProdDeps(pkgFiles);
+    const wsPackages = loadWsPackages(pkgFiles);
+    const result = resolveAllProdDeps(directProd, tmp, wsPackages);
+
+    assert.ok(result.has("B@1.0.0"),
+      "B should be prod — ws1 depends on A which peers B, and ws1 didn't declare B as dev");
+  });
+
+  it("dev-only peer dep reachable through regular deps is still included", () => {
+    // Workspace: dependencies: { A, D }, devDependencies: { B }
+    // A: peerDependencies: { B }
+    // D: dependencies: { B }
+    // B is dev-only via A's peer dep, but prod via D's regular dep
+    makePkg(tmp, {
+      name: "app", version: "1.0.0",
+      dependencies: { A: "1.0.0", D: "1.0.0" },
+      devDependencies: { B: "1.0.0" },
+    });
+    makeNodeModule(tmp, "A", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "D", "1.0.0", "MIT", { B: "^1.0.0" });
+    makeNodeModule(tmp, "B", "1.0.0", "MIT");
+
+    const pkgFiles = [join(tmp, "package.json")];
+    const directProd = collectDirectProdDeps(pkgFiles);
+    const wsPackages = loadWsPackages(pkgFiles);
+    const result = resolveAllProdDeps(directProd, tmp, wsPackages);
+
+    assert.ok(result.has("B@1.0.0"),
+      "B reachable through D's regular dependency, regardless of peer dev classification");
+  });
+
+  it("A->B dependency edge present when both prod and peer dep is dev-only", () => {
+    // Same setup as above — B is prod via D, A peers B (dev-only)
+    // The dependency graph should include A->B edge since both are prod
+    makePkg(tmp, {
+      name: "app", version: "1.0.0",
+      dependencies: { A: "1.0.0", D: "1.0.0" },
+      devDependencies: { B: "1.0.0" },
+    });
+    makeNodeModule(tmp, "A", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "D", "1.0.0", "MIT", { B: "^1.0.0" });
+    makeNodeModule(tmp, "B", "1.0.0", "MIT");
+
+    const pkgFiles = [join(tmp, "package.json")];
+    const directProd = collectDirectProdDeps(pkgFiles);
+    const wsPackages = loadWsPackages(pkgFiles);
+    const prodKeys = new Set(resolveAllProdDeps(directProd, tmp, wsPackages).keys());
+
+    const bom = minimalBom([
+      { name: "A", version: "1.0.0" },
+      { name: "B", version: "1.0.0" },
+      { name: "D", version: "1.0.0" },
+    ]);
+    bom.dependencies.find(d => d.ref === "pkg:npm/A@1.0.0").dependsOn = ["pkg:npm/B@1.0.0"];
+    bom.dependencies.find(d => d.ref === "pkg:npm/D@1.0.0").dependsOn = ["pkg:npm/B@1.0.0"];
+
+    const result = filterProdOnly(bom, prodKeys, new Map());
+
+    assert.equal(result.components.length, 3, "all three are prod");
+    const aDep = result.dependencies.find(d => d.ref === "pkg:npm/A@1.0.0");
+    assert.ok(aDep.dependsOn.includes("pkg:npm/B@1.0.0"),
+      "A->B edge should be present since both are prod components");
+  });
+
+  it("transitive deps of dev-only peer dep are excluded", () => {
+    // Workspace: dependencies: { A }, devDependencies: { B }
+    // A: peerDependencies: { B }
+    // B: dependencies: { X }, X: dependencies: { Y }
+    makePkg(tmp, {
+      name: "app", version: "1.0.0",
+      dependencies: { A: "1.0.0" },
+      devDependencies: { B: "1.0.0" },
+    });
+    makeNodeModule(tmp, "A", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "B", "1.0.0", "MIT", { X: "^1.0.0" });
+    makeNodeModule(tmp, "X", "1.0.0", "MIT", { Y: "^1.0.0" });
+    makeNodeModule(tmp, "Y", "1.0.0", "MIT");
+
+    const pkgFiles = [join(tmp, "package.json")];
+    const directProd = collectDirectProdDeps(pkgFiles);
+    const wsPackages = loadWsPackages(pkgFiles);
+    const result = resolveAllProdDeps(directProd, tmp, wsPackages);
+
+    assert.ok(!result.has("B@1.0.0"), "B excluded");
+    assert.ok(!result.has("X@1.0.0"), "X excluded (transitive of B)");
+    assert.ok(!result.has("Y@1.0.0"), "Y excluded (transitive of X of B)");
+  });
+
+  it("optional dep of dev-only peer dep is excluded", () => {
+    // Workspace: dependencies: { A }, devDependencies: { B }
+    // A: peerDependencies: { B }
+    // B: optionalDependencies: { C }
+    makePkg(tmp, {
+      name: "app", version: "1.0.0",
+      dependencies: { A: "1.0.0" },
+      devDependencies: { B: "1.0.0" },
+    });
+    makeNodeModule(tmp, "A", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "B", "1.0.0", "MIT", null, { optionalDependencies: { C: "^1.0.0" } });
+    makeNodeModule(tmp, "C", "1.0.0", "MIT");
+
+    const pkgFiles = [join(tmp, "package.json")];
+    const directProd = collectDirectProdDeps(pkgFiles);
+    const wsPackages = loadWsPackages(pkgFiles);
+    const result = resolveAllProdDeps(directProd, tmp, wsPackages);
+
+    assert.ok(!result.has("B@1.0.0"));
+    assert.ok(!result.has("C@1.0.0"), "optional dep of dev-only B also excluded");
+  });
+
+  it("multi-workspace different declarations — undeclared wins", () => {
+    // Workspace-1: dependencies: { A }, devDependencies: { B }
+    // Workspace-2: dependencies: { A } (no B declaration)
+    // A: peerDependencies: { B }
+    const ws1 = join(tmp, "packages", "ws1");
+    const ws2 = join(tmp, "packages", "ws2");
+    makePkg(tmp, {
+      name: "root", version: "1.0.0",
+      workspaces: ["packages/*"],
+    });
+    makePkg(ws1, {
+      name: "ws1", version: "1.0.0",
+      dependencies: { A: "1.0.0" },
+      devDependencies: { B: "1.0.0" },
+    });
+    makePkg(ws2, {
+      name: "ws2", version: "1.0.0",
+      dependencies: { A: "1.0.0" },
+    });
+    makeNodeModule(tmp, "A", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "B", "1.0.0", "MIT");
+
+    const pkgFiles = [join(ws1, "package.json"), join(ws2, "package.json")];
+    const directProd = collectDirectProdDeps(pkgFiles);
+    const wsPackages = loadWsPackages(pkgFiles);
+    const result = resolveAllProdDeps(directProd, tmp, wsPackages);
+
+    assert.ok(result.has("B@1.0.0"),
+      "B should be prod — ws2 depends on A but didn't declare B as dev");
   });
 });
 
