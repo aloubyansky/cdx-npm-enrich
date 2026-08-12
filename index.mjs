@@ -200,14 +200,28 @@ export function resolvePackageDir(name, fromDir, rootDir) {
  * and optionalDependencies (which package managers like pnpm install
  * and make accessible at runtime).
  *
+ * Peer dependencies are gated by the consumer workspace's declaration:
+ * if every workspace that has the declaring package in its dependencies
+ * also lists the peer dep in devDependencies (and not in dependencies),
+ * the peer dep is considered dev-only and skipped.  If any consumer
+ * workspace does not declare the peer dep at all, it is followed
+ * (safe default — the declaring package needs it at runtime).
+ *
+ * Packages reachable through regular dependency edges are always
+ * included regardless of peer dep classification.
+ *
  * For pnpm virtual packages (store entries with `_` in the directory
  * name, e.g. `debug@4.4.3_supports-color@8.1.1`), also scans sibling
  * entries in the store's `node_modules/` to discover implicit peer
  * bindings not declared in `package.json`.
  *
- * Returns a Map of "name@version" -> info.
+ * @param directProd direct production deps from workspace package.json files
+ * @param rootDir project root directory
+ * @param wsPackages optional Map of workspace dir to parsed package.json,
+ *        used for peer dep dev/prod classification
+ * @returns Map of "name@version" -> info
  */
-export function resolveAllProdDeps(directProd, rootDir) {
+export function resolveAllProdDeps(directProd, rootDir, wsPackages = new Map()) {
   const allProd = new Map();
   const scannedStoreEntries = new Set();
   const queue = [...directProd];
@@ -235,7 +249,9 @@ export function resolveAllProdDeps(directProd, rootDir) {
         queue.push({ name: dep, fromDir: pkgDir });
       }
       for (const dep of Object.keys(pkg.peerDependencies || {})) {
-        queue.push({ name: dep, fromDir: pkgDir, optional: true });
+        if (!isDevOnlyPeerDep(dep, name, wsPackages)) {
+          queue.push({ name: dep, fromDir: pkgDir, optional: true });
+        }
       }
       for (const dep of Object.keys(pkg.optionalDependencies || {})) {
         queue.push({ name: dep, fromDir: pkgDir, optional: true });
@@ -248,6 +264,45 @@ export function resolveAllProdDeps(directProd, rootDir) {
     }
   }
   return allProd;
+}
+
+/**
+ * Checks whether a peer dependency should be skipped during the
+ * production walk.
+ *
+ * A peer dep is dev-only when every workspace that has the declaring
+ * package in its dependencies also lists the peer dep in its
+ * devDependencies (and not in its dependencies).  If any consumer
+ * workspace does not declare the peer dep at all — or lists it in
+ * dependencies — the peer dep is followed.
+ *
+ * @param peerName the peer dependency name
+ * @param declaringPkg the package that declares the peer dependency
+ * @param wsPackages Map of workspace dir to parsed package.json
+ * @returns true if the peer dep should be skipped
+ */
+function isDevOnlyPeerDep(peerName, declaringPkg, wsPackages) {
+  let anyConsumer = false;
+  for (const [, wsPkg] of wsPackages) {
+    const wsDeps = wsPkg.dependencies || {};
+    if (!(declaringPkg in wsDeps)) continue;
+    anyConsumer = true;
+    const wsDevDeps = wsPkg.devDependencies || {};
+    if (!(peerName in wsDevDeps) || peerName in wsDeps) {
+      return false;
+    }
+  }
+  if (anyConsumer) return true;
+  // No workspace directly depends on the declaring package (it's a
+  // transitive dep).  Fall back to a project-level check: if the peer
+  // dep appears only in devDependencies across all workspaces, treat
+  // it as dev-only.
+  let inDev = false;
+  for (const [, wsPkg] of wsPackages) {
+    if (peerName in (wsPkg.dependencies || {})) return false;
+    if (peerName in (wsPkg.devDependencies || {})) inDev = true;
+  }
+  return inDev;
 }
 
 /**
@@ -709,7 +764,11 @@ if (isMainModule()) {
 
   const pkgFiles = discoverWorkspacePackages(projectDir);
   const directProd = collectDirectProdDeps(pkgFiles);
-  const allProd = resolveAllProdDeps(directProd, projectDir);
+  const wsPackages = new Map();
+  for (const pf of pkgFiles) {
+    wsPackages.set(dirname(pf), JSON.parse(readFileSync(pf, "utf8")));
+  }
+  const allProd = resolveAllProdDeps(directProd, projectDir, wsPackages);
 
   const prodKeys = new Set(allProd.keys());
   const licensesByKey = new Map();
