@@ -842,6 +842,34 @@ describe("peer dep dev/prod classification", () => {
     assert.ok(result.has("B@1.0.0"),
       "B should be prod — ws2 depends on A but didn't declare B as dev");
   });
+
+  it("transitive package's peer dep followed despite workspace devDependency", () => {
+    // Workspace: dependencies: { A }, devDependencies: { B }
+    // A: dependencies: { C }
+    // C: peerDependencies: { B }
+    // C is transitive — no workspace directly depends on it.
+    // B is in workspace devDependencies, but that's the workspace's own
+    // relationship to B, not C's. C needs B at runtime.
+    makePkg(tmp, {
+      name: "app", version: "1.0.0",
+      dependencies: { A: "1.0.0" },
+      devDependencies: { B: "1.0.0" },
+    });
+    makeNodeModule(tmp, "A", "1.0.0", "MIT", { C: "^1.0.0" });
+    makeNodeModule(tmp, "C", "1.0.0", "MIT", null, { peerDependencies: { B: "^1.0.0" } });
+    makeNodeModule(tmp, "B", "1.0.0", "MIT");
+
+    const pkgFiles = [join(tmp, "package.json")];
+    const directProd = collectDirectProdDeps(pkgFiles);
+    const wsPackages = loadWsPackages(pkgFiles);
+    const result = resolveAllProdDeps(directProd, tmp, wsPackages);
+
+    assert.ok(result.has("A@1.0.0"));
+    assert.ok(result.has("C@1.0.0"));
+    assert.ok(result.has("B@1.0.0"),
+      "B should be prod — C is transitive and needs B at runtime; " +
+      "workspace devDependency on B is unrelated to C's peer dep");
+  });
 });
 
 // ── componentKey ─────────────────────────────────────────────────────

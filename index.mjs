@@ -347,9 +347,10 @@ export function resolveAllProdDeps(directProd, rootDir, wsPackages = new Map()) 
  * devDependencies (and not in its dependencies).  If any consumer
  * does not declare the peer dep at all, it is followed (safe default).
  *
- * For transitive declaring packages (not directly in any workspace),
- * falls back to a project-level check: the peer dep is dev-only if
- * it appears only in devDependencies across all workspaces.
+ * For transitive declaring packages (not directly in any workspace's
+ * dependencies), the peer dep is always followed — the workspace's
+ * own devDependencies are unrelated to the transitive package's
+ * runtime needs.
  */
 function isDevOnlyPeerDep(peerName, declaringPkg, wsPackages) {
   let anyConsumer = false;
@@ -362,13 +363,7 @@ function isDevOnlyPeerDep(peerName, declaringPkg, wsPackages) {
       return false;
     }
   }
-  if (anyConsumer) return true;
-  let inDev = false;
-  for (const [, wsPkg] of wsPackages) {
-    if (peerName in (wsPkg.dependencies || {})) return false;
-    if (peerName in (wsPkg.devDependencies || {})) inDev = true;
-  }
-  return inDev;
+  return anyConsumer;
 }
 
 /**

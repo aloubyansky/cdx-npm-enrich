@@ -101,7 +101,7 @@ A `peerDependencies` declaration is neutral — it says "the host must provide t
   - B in the workspace's `devDependencies` (not in `dependencies`) → **dev-only** (consumer signaled it's not needed at runtime)
   - B not declared by the workspace at all → **production** (safe default — the consumer didn't signal dev-only, and A needs B at runtime)
 
-- If A is a **transitive** dependency (not directly in any workspace's `dependencies`), the tool falls back to a project-level check: B is dev-only if it appears only in `devDependencies` across all workspaces and never in any workspace's `dependencies`
+- If A is a **transitive** dependency (not directly in any workspace's `dependencies`), no workspace is the direct consumer of A's peer dep. In this case the peer dep is always followed — the workspace's own `devDependencies` are unrelated to A's runtime needs
 
 - A package reached as dev-only through a peer dep edge can still be production if it's reachable through a regular `dependencies` edge from another production package. Classification never downgrades from prod to dev
 
