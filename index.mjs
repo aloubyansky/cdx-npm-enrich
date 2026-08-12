@@ -1,14 +1,19 @@
 #!/usr/bin/env node
 
 /**
- * Enriches a CycloneDX SBOM for a Node.js project with accurate
- * dependency scope and missing license data.
+ * Post-processing utility that enriches a CycloneDX SBOM produced by
+ * a Node.js SBOM generator.  Not a generator itself — it takes an
+ * existing SBOM as input, cross-references it against package.json
+ * dependency declarations and node_modules contents (not the lockfile),
+ * and improves scope classification, license coverage, and hash
+ * placement.
  *
  * Works with SBOMs from any generator (cdxgen, @cyclonedx/yarn-plugin,
- * npm sbom, pnpm sbom).  The enrichment walks package.json
- * "dependencies" (not "devDependencies") across all workspaces to
- * classify each component as production or dev-only — a more reliable
- * signal than lockfile-based heuristics.
+ * npm sbom, pnpm sbom).  The enrichment builds the dependency graph
+ * reachable from workspace "dependencies" (never following
+ * "devDependencies"), then classifies each package as production or
+ * dev-only based on edge types and consumer declarations — a more
+ * reliable signal than lockfile-based heuristics.
  *
  * By default, keeps all components but marks dev-only ones with
  * CycloneDX scope "excluded" (not reachable at runtime).  Production
@@ -195,39 +200,28 @@ export function resolvePackageDir(name, fromDir, rootDir) {
 }
 
 /**
- * Transitively resolve all production dependencies starting from
- * the direct prod deps.  Follows dependencies, peerDependencies,
- * and optionalDependencies (which package managers like pnpm install
- * and make accessible at runtime).
+ * Build the full dependency graph reachable from direct production
+ * dependencies.  Follows all edge types (dependencies,
+ * peerDependencies, optionalDependencies) without filtering.
  *
- * Peer dependencies are gated by the consumer workspace's declaration:
- * if every workspace that has the declaring package in its dependencies
- * also lists the peer dep in devDependencies (and not in dependencies),
- * the peer dep is considered dev-only and skipped.  If any consumer
- * workspace does not declare the peer dep at all, it is followed
- * (safe default — the declaring package needs it at runtime).
- *
- * Packages reachable through regular dependency edges are always
- * included regardless of peer dep classification.
+ * Each node records its package metadata and the edges through
+ * which it was reached, enabling a separate classification pass.
  *
  * For pnpm virtual packages (store entries with `_` in the directory
- * name, e.g. `debug@4.4.3_supports-color@8.1.1`), also scans sibling
- * entries in the store's `node_modules/` to discover implicit peer
- * bindings not declared in `package.json`.
+ * name), also scans sibling entries to discover implicit peer bindings.
  *
  * @param directProd direct production deps from workspace package.json files
  * @param rootDir project root directory
- * @param wsPackages optional Map of workspace dir to parsed package.json,
- *        used for peer dep dev/prod classification
- * @returns Map of "name@version" -> info
+ * @returns Map of "name@version" -> { name, version, license, edges }
+ *          where edges is an array of { type, from } records
  */
-export function resolveAllProdDeps(directProd, rootDir, wsPackages = new Map()) {
-  const allProd = new Map();
+export function buildDependencyGraph(directProd, rootDir) {
+  const graph = new Map();
   const scannedStoreEntries = new Set();
-  const queue = [...directProd];
+  const queue = directProd.map(d => ({ ...d, edgeType: "prod", from: null }));
 
   while (queue.length) {
-    const { name, fromDir, optional } = queue.pop();
+    const { name, fromDir, optional, edgeType, from } = queue.pop();
     const pkgDir = resolvePackageDir(name, fromDir, rootDir);
     if (!pkgDir) {
       if (!optional) {
@@ -243,43 +237,119 @@ export function resolveAllProdDeps(directProd, rootDir, wsPackages = new Map()) 
       );
       const ver = pkg.version || "0";
       const key = `${name}@${ver}`;
-      if (allProd.has(key)) continue;
-      allProd.set(key, { name, version: ver, license: pkg.license });
+      const edge = { type: edgeType, from };
+      const existing = graph.get(key);
+      if (existing) {
+        existing.edges.push(edge);
+        continue;
+      }
+      graph.set(key, { name, version: ver, license: pkg.license, edges: [edge] });
       for (const dep of Object.keys(pkg.dependencies || {})) {
-        queue.push({ name: dep, fromDir: pkgDir });
+        queue.push({ name: dep, fromDir: pkgDir, edgeType: "dep", from: key });
       }
       for (const dep of Object.keys(pkg.peerDependencies || {})) {
-        if (!isDevOnlyPeerDep(dep, name, wsPackages)) {
-          queue.push({ name: dep, fromDir: pkgDir, optional: true });
-        }
+        queue.push({ name: dep, fromDir: pkgDir, optional: true,
+          edgeType: "peer", from: key });
       }
       for (const dep of Object.keys(pkg.optionalDependencies || {})) {
-        queue.push({ name: dep, fromDir: pkgDir, optional: true });
+        queue.push({ name: dep, fromDir: pkgDir, optional: true,
+          edgeType: "optional", from: key });
       }
-      scanPnpmVirtualSiblings(pkgDir, queue, scannedStoreEntries);
+      scanPnpmVirtualSiblings(pkgDir, queue, scannedStoreEntries, key);
     } catch (e) {
       console.warn(
         `Warning: could not read package.json for '${name}' in ${pkgDir}: ${e.message}`,
       );
     }
   }
-  return allProd;
+  return graph;
 }
 
 /**
- * Checks whether a peer dependency should be skipped during the
- * production walk.
+ * Classify packages as production or dev-only by propagating prod
+ * status through the dependency graph.
+ *
+ * Starting from direct prod deps, a package is production if it is
+ * reachable through:
+ * - dependency or optional-dependency edges (always prod), or
+ * - peer-dependency edges that are not dev-only per workspace
+ *   declarations.
+ *
+ * @param graph the full dependency graph from {@link buildDependencyGraph}
+ * @param wsPackages Map of workspace dir to parsed package.json
+ * @returns Map of "name@version" -> { name, version, license } for
+ *          production packages only
+ */
+export function classifyProdDev(graph, wsPackages = new Map()) {
+  // Build adjacency list: parent key -> [{ childKey, edgeType }]
+  const children = new Map();
+  for (const [childKey, childNode] of graph) {
+    for (const edge of childNode.edges) {
+      if (edge.from === null) continue;
+      let list = children.get(edge.from);
+      if (!list) { list = []; children.set(edge.from, list); }
+      list.push({ childKey, edgeType: edge.type });
+    }
+  }
+
+  const prodKeys = new Set();
+  const queue = [];
+
+  for (const [key, node] of graph) {
+    if (node.edges.some(e => e.type === "prod")) {
+      prodKeys.add(key);
+      queue.push(key);
+    }
+  }
+
+  while (queue.length) {
+    const key = queue.pop();
+    const node = graph.get(key);
+    if (!node) continue;
+
+    for (const { childKey, edgeType } of children.get(key) || []) {
+      if (prodKeys.has(childKey)) continue;
+      if (edgeType === "dep" || edgeType === "optional") {
+        prodKeys.add(childKey);
+        queue.push(childKey);
+      } else if (edgeType === "peer") {
+        const childNode = graph.get(childKey);
+        if (childNode && !isDevOnlyPeerDep(childNode.name, node.name, wsPackages)) {
+          prodKeys.add(childKey);
+          queue.push(childKey);
+        }
+      }
+    }
+  }
+
+  const result = new Map();
+  for (const key of prodKeys) {
+    const node = graph.get(key);
+    result.set(key, { name: node.name, version: node.version, license: node.license });
+  }
+  return result;
+}
+
+/**
+ * Convenience wrapper: builds the graph and classifies in one call.
+ * API-compatible with the previous resolveAllProdDeps.
+ */
+export function resolveAllProdDeps(directProd, rootDir, wsPackages = new Map()) {
+  const graph = buildDependencyGraph(directProd, rootDir);
+  return classifyProdDev(graph, wsPackages);
+}
+
+/**
+ * Checks whether a peer dependency should be treated as dev-only.
  *
  * A peer dep is dev-only when every workspace that has the declaring
  * package in its dependencies also lists the peer dep in its
  * devDependencies (and not in its dependencies).  If any consumer
- * workspace does not declare the peer dep at all — or lists it in
- * dependencies — the peer dep is followed.
+ * does not declare the peer dep at all, it is followed (safe default).
  *
- * @param peerName the peer dependency name
- * @param declaringPkg the package that declares the peer dependency
- * @param wsPackages Map of workspace dir to parsed package.json
- * @returns true if the peer dep should be skipped
+ * For transitive declaring packages (not directly in any workspace),
+ * falls back to a project-level check: the peer dep is dev-only if
+ * it appears only in devDependencies across all workspaces.
  */
 function isDevOnlyPeerDep(peerName, declaringPkg, wsPackages) {
   let anyConsumer = false;
@@ -293,10 +363,6 @@ function isDevOnlyPeerDep(peerName, declaringPkg, wsPackages) {
     }
   }
   if (anyConsumer) return true;
-  // No workspace directly depends on the declaring package (it's a
-  // transitive dep).  Fall back to a project-level check: if the peer
-  // dep appears only in devDependencies across all workspaces, treat
-  // it as dev-only.
   let inDev = false;
   for (const [, wsPkg] of wsPackages) {
     if (peerName in (wsPkg.dependencies || {})) return false;
@@ -310,14 +376,13 @@ function isDevOnlyPeerDep(peerName, declaringPkg, wsPackages) {
  * whose directory name contains `_`, indicating resolved peers),
  * scan sibling entries and queue them for resolution.
  */
-function scanPnpmVirtualSiblings(pkgDir, queue, scannedStoreEntries) {
+function scanPnpmVirtualSiblings(pkgDir, queue, scannedStoreEntries, parentKey) {
   let realDir;
   try { realDir = realpathSync(pkgDir); } catch { return; }
   // Match .pnpm/<name>@<version>_<peer>/node_modules/<pkg>
   const parts = realDir.split("/node_modules/");
   if (parts.length < 2) return;
   const storeSegment = parts[parts.length - 2];
-  // Extract the store entry name from the segment (e.g. "debug@4.0.0_supports-color@8.0.0")
   const pnpmPrefix = ".pnpm/";
   const pnpmIdx = storeSegment.lastIndexOf(pnpmPrefix);
   if (pnpmIdx < 0) return;
@@ -325,7 +390,6 @@ function scanPnpmVirtualSiblings(pkgDir, queue, scannedStoreEntries) {
   if (!entryName.includes("_")) return;
   if (scannedStoreEntries.has(entryName)) return;
   scannedStoreEntries.add(entryName);
-  // Scan siblings — for scoped packages (@scope/name), go up two levels
   const lastPart = parts[parts.length - 1];
   const siblingsDir = lastPart.includes("/")
     ? join(realDir, "..", "..")
@@ -338,12 +402,14 @@ function scanPnpmVirtualSiblings(pkgDir, queue, scannedStoreEntries) {
         const scopeDir = join(siblingsDir, entry);
         for (const sub of readdirSync(scopeDir)) {
           if (existsSync(join(scopeDir, sub, "package.json"))) {
-            queue.push({ name: `${entry}/${sub}`, fromDir: storeFromDir, optional: true });
+            queue.push({ name: `${entry}/${sub}`, fromDir: storeFromDir,
+              optional: true, edgeType: "peer", from: parentKey });
           }
         }
       } else {
         if (existsSync(join(siblingsDir, entry, "package.json"))) {
-          queue.push({ name: entry, fromDir: storeFromDir, optional: true });
+          queue.push({ name: entry, fromDir: storeFromDir,
+            optional: true, edgeType: "peer", from: parentKey });
         }
       }
     }
