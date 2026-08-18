@@ -17,7 +17,9 @@
  *
  * By default, keeps all components but marks dev-only ones with
  * CycloneDX scope "excluded" (not reachable at runtime).  Production
- * components have their scope cleared (implied "required" per spec).
+ * components reachable only through optionalDependencies edges retain
+ * scope "optional".  All other production components have their scope
+ * cleared (implied "required" per spec).
  *
  * With --prod-only, strips dev-only components and their dependency
  * entries entirely.
@@ -277,8 +279,9 @@ export function buildDependencyGraph(directProd, rootDir) {
  *
  * @param graph the full dependency graph from {@link buildDependencyGraph}
  * @param wsPackages Map of workspace dir to parsed package.json
- * @returns Map of "name@version" -> { name, version, license } for
- *          production packages only
+ * @returns Map of "name@version" -> { name, version, license, optional } for
+ *          production packages only.  `optional` is true when the package
+ *          is reachable exclusively through optionalDependencies edges
  */
 export function classifyProdDev(graph, wsPackages = new Map()) {
   // Build adjacency list: parent key -> [{ childKey, edgeType }]
@@ -292,31 +295,44 @@ export function classifyProdDev(graph, wsPackages = new Map()) {
     }
   }
 
+  // Track required (non-optional) and optional-only prod packages separately.
+  // A package is "required" if it's reachable through at least one
+  // non-optional edge chain.  It's "optional" if every path from a
+  // direct prod dep goes through at least one optionalDependencies edge.
   const prodKeys = new Set();
+  const requiredKeys = new Set();
   const queue = [];
 
   for (const [key, node] of graph) {
     if (node.edges.some(e => e.type === "prod")) {
       prodKeys.add(key);
-      queue.push(key);
+      requiredKeys.add(key);
+      queue.push({ key, required: true });
     }
   }
 
   while (queue.length) {
-    const key = queue.pop();
+    const { key, required } = queue.pop();
     const node = graph.get(key);
     if (!node) continue;
 
     for (const { childKey, edgeType } of children.get(key) || []) {
-      if (prodKeys.has(childKey)) continue;
+      const childRequired = required && edgeType !== "optional";
+      const isNew = !prodKeys.has(childKey);
+      const upgradeToRequired = !isNew && childRequired && !requiredKeys.has(childKey);
+
+      if (!isNew && !upgradeToRequired) continue;
+
       if (edgeType === "dep" || edgeType === "optional") {
         prodKeys.add(childKey);
-        queue.push(childKey);
+        if (childRequired) requiredKeys.add(childKey);
+        queue.push({ key: childKey, required: childRequired });
       } else if (edgeType === "peer") {
         const childNode = graph.get(childKey);
         if (childNode && !isDevOnlyPeerDep(childNode.name, node.name, wsPackages)) {
           prodKeys.add(childKey);
-          queue.push(childKey);
+          if (childRequired) requiredKeys.add(childKey);
+          queue.push({ key: childKey, required: childRequired });
         }
       }
     }
@@ -325,7 +341,12 @@ export function classifyProdDev(graph, wsPackages = new Map()) {
   const result = new Map();
   for (const key of prodKeys) {
     const node = graph.get(key);
-    result.set(key, { name: node.name, version: node.version, license: node.license });
+    result.set(key, {
+      name: node.name,
+      version: node.version,
+      license: node.license,
+      optional: !requiredKeys.has(key),
+    });
   }
   return result;
 }
@@ -714,24 +735,23 @@ export function enrichLicense(component, licensesByKey, rootDir) {
  * Keeps all components and the full dependency graph.
  * Returns the modified bom.
  */
-export function markDevExcluded(bom, prodKeys, licensesByKey, rootDir, hashMap) {
+export function markDevExcluded(bom, prodKeys, licensesByKey, rootDir, hashMap, prodInfo) {
   let prodCount = 0;
   let excludedCount = 0;
   for (const c of bom.components || []) {
-    if (prodKeys.has(componentKey(c))) {
+    const key = componentKey(c);
+    if (prodKeys.has(key)) {
       prodCount++;
-      // Clear any generator-assigned scope.  SBOM generators like cdxgen
-      // mark most lockfile entries as "optional" because they cannot
-      // confirm runtime usage from static analysis alone.  We override
-      // with a more accurate signal: transitive walk of package.json
-      // "dependencies" (not "devDependencies") across all workspaces.
-      // Omitting scope means "required" per the CycloneDX spec.
-      delete c.scope;
+      const info = prodInfo?.get(key);
+      if (info?.optional) {
+        c.scope = "optional";
+      } else {
+        delete c.scope;
+      }
       enrichLicense(c, licensesByKey, rootDir);
       if (hashMap) enrichHash(c, hashMap);
       enrichEvidence(c);
     } else {
-      // Not reachable at runtime — only needed for build, test, or dev.
       c.scope = "excluded";
       excludedCount++;
       enrichLicense(c, licensesByKey, rootDir);
@@ -746,12 +766,18 @@ export function markDevExcluded(bom, prodKeys, licensesByKey, rootDir, hashMap) 
  * components and pruning the dependency graph.
  * Returns the filtered bom.
  */
-export function filterProdOnly(bom, prodKeys, licensesByKey, rootDir, hashMap) {
+export function filterProdOnly(bom, prodKeys, licensesByKey, rootDir, hashMap, prodInfo) {
   const matchingRefs = new Set();
   const filteredComponents = (bom.components || []).filter((c) => {
-    if (prodKeys.has(componentKey(c))) {
+    const key = componentKey(c);
+    if (prodKeys.has(key)) {
       matchingRefs.add(c["bom-ref"]);
-      delete c.scope;
+      const info = prodInfo?.get(key);
+      if (info?.optional) {
+        c.scope = "optional";
+      } else {
+        delete c.scope;
+      }
       enrichLicense(c, licensesByKey, rootDir);
       if (hashMap) enrichHash(c, hashMap);
       enrichEvidence(c);
@@ -841,7 +867,7 @@ if (isMainModule()) {
   const bom = JSON.parse(readFileSync(sbomPath, "utf8"));
 
   if (prodOnlyFlag) {
-    const filtered = filterProdOnly(bom, prodKeys, licensesByKey, projectDir, hashMap);
+    const filtered = filterProdOnly(bom, prodKeys, licensesByKey, projectDir, hashMap, allProd);
     writeFileSync(outPath, JSON.stringify(filtered, null, 2));
     const withLicense = filtered.components.filter(
       (c) => c.licenses && c.licenses.length > 0,
@@ -854,7 +880,7 @@ if (isMainModule()) {
     );
   } else {
     const { prodCount, excludedCount } = markDevExcluded(
-      bom, prodKeys, licensesByKey, projectDir, hashMap,
+      bom, prodKeys, licensesByKey, projectDir, hashMap, allProd,
     );
     writeFileSync(outPath, JSON.stringify(bom, null, 2));
     console.log(

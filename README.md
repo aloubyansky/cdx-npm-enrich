@@ -11,7 +11,7 @@ CycloneDX SBOM generators for Node.js produce varying levels of scope and licens
 
 This tool post-processes a generator's output to ensure:
 
-- **Scope classification**: dev-only dependencies are marked `scope: "excluded"` (not reachable at runtime per the [CycloneDX spec](https://cyclonedx.org/docs/1.6/json/#components_items_scope)), production dependencies have their scope cleared (implied `"required"`)
+- **Scope classification**: dev-only dependencies are marked `scope: "excluded"` (not reachable at runtime per the [CycloneDX spec](https://cyclonedx.org/docs/1.6/json/#components_items_scope)). Production dependencies reachable only through `optionalDependencies` edges retain `scope: "optional"`. All other production dependencies have their scope cleared (implied `"required"`)
 - **Complete licenses**: components missing license metadata are enriched from `node_modules/*/package.json`
 - **Hashes**: if a component's `externalReferences[type=distribution]` entry has no hashes, a SHA-512 checksum from the lockfile (`yarn.lock`, `pnpm-lock.yaml`, or `package-lock.json`) is added. Hashes are placed on the distribution external reference per the CycloneDX spec (the hash is of the registry tarball, not the component content itself). Existing distribution hashes are preserved
 - **Evidence**: production components receive CycloneDX `evidence.identity` confirming their PURL was verified via `manifest-analysis` (reading `package.json` from `node_modules`). Confidence is set to 0.6 — the top of the [CycloneDX-recommended range](https://github.com/CycloneDX/guides/blob/main/SBOM/en/0x60-Evidence.md) for manifest analysis. This is more conservative than cdxgen's 1.0: a lockfile or `package.json` confirms a package was declared and installed, but does not verify that its contents match a known-good artifact (e.g., via content hash). Existing `evidence.identity` from the upstream SBOM generator is preserved
@@ -87,10 +87,10 @@ Dependencies are resolved from per-workspace `node_modules` directories, includi
 
 1. **Workspace discovery**: finds all workspace packages from `package.json` (`workspaces` field) or `pnpm-workspace.yaml`
 2. **Graph construction**: collects direct production dependencies (`dependencies`, not `devDependencies`) from each workspace, skipping `workspace:` protocol references. Transitively walks reachable packages through `node_modules`, following `dependencies`, `peerDependencies`, and `optionalDependencies` at each level — `devDependencies` are never followed. Symlinks are resolved so that pnpm's `.pnpm` store siblings are reachable. For pnpm virtual packages (store entries with `_` in the directory name), sibling entries are scanned to discover implicit peer bindings
-3. **Prod/dev classification**: propagates production status through the graph. Regular dependencies and optional dependencies are always production. Peer dependencies are classified based on how the consuming workspace declared them (see below)
+3. **Prod/dev classification**: propagates production status through the graph. Regular dependencies and optional dependencies are always production. Packages reachable exclusively through `optionalDependencies` edges (including their transitive children) are marked `optional`. A package reachable through both a required and an optional path is classified as required. Peer dependencies are classified based on how the consuming workspace declared them (see below)
 4. **Lockfile parsing**: reads SHA-512 checksums from `yarn.lock`, `pnpm-lock.yaml`, or `package-lock.json`
 5. **Enrichment**: adds missing license data, hashes (on `externalReferences[type=distribution]`), and `evidence.identity` to production components. Removes `component.hashes` entries that duplicate distribution tarball hashes
-6. **Output**: production components have their scope cleared (implied `"required"` per CycloneDX spec). Dev-only components get `scope: "excluded"` (or are removed in `--prod-only` mode)
+6. **Output**: required production components have their scope cleared (implied `"required"` per CycloneDX spec). Optional-only production components get `scope: "optional"`. Dev-only components get `scope: "excluded"` (or are removed in `--prod-only` mode)
 
 ### Peer dependency classification
 
