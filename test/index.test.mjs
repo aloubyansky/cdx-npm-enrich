@@ -11,6 +11,8 @@ import {
   collectDirectProdDeps,
   resolvePackageDir,
   resolveAllProdDeps,
+  buildDependencyGraph,
+  classifyProdDev,
   componentKey,
   buildLicenses,
   buildLicenseEntry,
@@ -348,7 +350,7 @@ describe("resolveAllProdDeps", () => {
     assert.ok(result.has("react@18.3.1"));
   });
 
-  it("follows optionalDependencies", () => {
+  it("follows optionalDependencies and marks them optional", () => {
     makeNodeModule(tmp, "tar-fs", "3.1.1", "MIT", { pump: "^3.0.0" }, { optionalDependencies: { "bare-fs": "^4.0.0" } });
     makeNodeModule(tmp, "pump", "3.0.3", "MIT");
     makeNodeModule(tmp, "bare-fs", "4.4.4", "Apache-2.0");
@@ -359,6 +361,34 @@ describe("resolveAllProdDeps", () => {
     assert.ok(result.has("tar-fs@3.1.1"));
     assert.ok(result.has("pump@3.0.3"));
     assert.ok(result.has("bare-fs@4.4.4"));
+    assert.equal(result.get("tar-fs@3.1.1").optional, false);
+    assert.equal(result.get("pump@3.0.3").optional, false);
+    assert.equal(result.get("bare-fs@4.4.4").optional, true);
+  });
+
+  it("transitive dep of optional dep is also optional", () => {
+    makeNodeModule(tmp, "app", "1.0.0", "MIT", null, { optionalDependencies: { opt: "^1.0.0" } });
+    makeNodeModule(tmp, "opt", "1.0.0", "MIT", { "opt-child": "^1.0.0" });
+    makeNodeModule(tmp, "opt-child", "1.0.0", "MIT");
+
+    const result = resolveAllProdDeps(
+      [{ name: "app", fromDir: tmp }], tmp,
+    );
+    assert.equal(result.get("opt@1.0.0").optional, true);
+    assert.equal(result.get("opt-child@1.0.0").optional, true);
+  });
+
+  it("package reachable through both required and optional edges is required", () => {
+    makeNodeModule(tmp, "a", "1.0.0", "MIT", { shared: "^1.0.0" }, { optionalDependencies: { opt: "^1.0.0" } });
+    makeNodeModule(tmp, "opt", "1.0.0", "MIT", { shared: "^1.0.0" });
+    makeNodeModule(tmp, "shared", "1.0.0", "MIT");
+
+    const result = resolveAllProdDeps(
+      [{ name: "a", fromDir: tmp }], tmp,
+    );
+    assert.equal(result.get("a@1.0.0").optional, false);
+    assert.equal(result.get("opt@1.0.0").optional, true);
+    assert.equal(result.get("shared@1.0.0").optional, false, "shared is reachable through required edge from a");
   });
 
   it("does not warn for uninstalled optional dependencies", () => {
@@ -1093,6 +1123,28 @@ describe("markDevExcluded", () => {
     markDevExcluded(bom, prodKeys, new Map());
     assert.equal(bom.dependencies.length, 2);
   });
+
+  it("preserves optional scope for optional-only prod deps", () => {
+    const bom = minimalBom([
+      { name: "react", version: "18.3.1", scope: "optional" },
+      { name: "bare-fs", version: "4.4.4", scope: "optional" },
+      { name: "jest", version: "29.0.0" },
+    ]);
+    const prodKeys = new Set(["react@18.3.1", "bare-fs@4.4.4"]);
+    const prodInfo = new Map([
+      ["react@18.3.1", { name: "react", version: "18.3.1", optional: false }],
+      ["bare-fs@4.4.4", { name: "bare-fs", version: "4.4.4", optional: true }],
+    ]);
+
+    markDevExcluded(bom, prodKeys, new Map(), undefined, undefined, prodInfo);
+
+    const react = bom.components.find((c) => c.name === "react");
+    const bareFs = bom.components.find((c) => c.name === "bare-fs");
+    const jest = bom.components.find((c) => c.name === "jest");
+    assert.equal(react.scope, undefined, "required dep should have scope cleared");
+    assert.equal(bareFs.scope, "optional", "optional-only dep should keep optional scope");
+    assert.equal(jest.scope, "excluded", "dev dep should be excluded");
+  });
 });
 
 // ── filterProdOnly ───────────────────────────────────────────────────
@@ -1124,7 +1176,7 @@ describe("filterProdOnly", () => {
     assert.equal(result.dependencies[0].dependsOn.length, 0);
   });
 
-  it("clears scope on kept components", () => {
+  it("clears scope on required kept components", () => {
     const bom = minimalBom([
       { name: "react", version: "18.3.1", scope: "optional" },
     ]);
@@ -1132,6 +1184,24 @@ describe("filterProdOnly", () => {
 
     const result = filterProdOnly(bom, prodKeys, new Map());
     assert.equal(result.components[0].scope, undefined);
+  });
+
+  it("preserves optional scope for optional-only kept components", () => {
+    const bom = minimalBom([
+      { name: "react", version: "18.3.1" },
+      { name: "bare-fs", version: "4.4.4" },
+    ]);
+    const prodKeys = new Set(["react@18.3.1", "bare-fs@4.4.4"]);
+    const prodInfo = new Map([
+      ["react@18.3.1", { name: "react", version: "18.3.1", optional: false }],
+      ["bare-fs@4.4.4", { name: "bare-fs", version: "4.4.4", optional: true }],
+    ]);
+
+    const result = filterProdOnly(bom, prodKeys, new Map(), undefined, undefined, prodInfo);
+    const react = result.components.find(c => c.name === "react");
+    const bareFs = result.components.find(c => c.name === "bare-fs");
+    assert.equal(react.scope, undefined, "required dep should have scope cleared");
+    assert.equal(bareFs.scope, "optional", "optional-only dep should keep optional scope");
   });
 
   it("enriches licenses on kept components", () => {
