@@ -1,6 +1,6 @@
 {
   "name": "@cyberstamp/cdx-npm-enrich",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Enrich CycloneDX npm SBOMs with dev/prod scope and missing licenses",
   "type": "module",
   "bin": {
